@@ -15,6 +15,8 @@ until the current one is confirmed.
 
 Say these plainly, then ask if they want to go ahead:
 
+- **Draft.** `server-setup.sh` has not yet been run end to end on a fresh server. If a step
+  fails, stop, read the error, and fix it before going on.
 - **Pinned to Buzz Desktop 0.5.28.** Check `Buzz > About` on their computer. A different
   version may not work. Do not proceed on another version without testing.
 - **Unofficial.** Buzz is building an official SSH provider (block/buzz PR #3449). When it
@@ -33,10 +35,36 @@ Say these plainly, then ask if they want to go ahead:
 - Every command below is run from the owner's computer unless it says otherwise.
   `HOST` is the server's IP address. Replace it in every command.
 
+## Phase 0: order the server
+
+Ask before anything is bought. The owner orders it in their own account; you never hold
+their hosting login.
+
+1. **Pick a host.** Any provider that sells a plain Linux server (often called a VPS) works.
+   This kit runs in production on Contabo. Hetzner, DigitalOcean and Vultr sell the same thing.
+2. **What to order:**
+   - Operating system: **Ubuntu 24.04 LTS**. Plain. No control panel (no cPanel, Plesk,
+     Webmin), no "apps" or one-click installs.
+   - Processor type: **x86_64** (also called AMD64 or Intel). Not ARM: Buzz has no ARM build.
+   - Size: **4 CPU cores, 8 GB RAM, 80 GB disk or more.** Smaller works for one quiet agent;
+     8 GB leaves room for several.
+   - Region: the one nearest the owner.
+   - Extras: none needed. Skip backups add-ons, extra IPs and managed firewalls. Snapshots
+     are worth having if the host offers them free.
+3. **Root password:** the order form usually asks for one. Have the owner generate a long one
+   in their password manager and save it there. They type it in their terminal once in
+   Phase 1. It never goes in chat.
+4. **Lock the hosting account:** have them switch on two-factor login in the provider's
+   account settings. Whoever holds this account can wipe or take over the server.
+5. **Find the address:** when the server is ready (minutes to a few hours), the provider
+   emails it and shows it in the panel. Look for "IPv4 address" or "IP": four numbers
+   separated by dots. That is `HOST` from here on. The address is fine to share in chat.
+
+**Proof:** the panel shows the server as running, Ubuntu 24.04, and its IPv4 address.
+
 ## Phase 1: the server and the key
 
-Prerequisites: a fresh **Ubuntu 24.04, x86_64** server with nothing else on it, and its
-root password from the hosting provider.
+Prerequisites: the server from Phase 0, and its root password.
 
 1. Ask if they have an SSH key: `ls ~/.ssh/id_ed25519.pub`. If not:
    `ssh-keygen -t ed25519` (press Enter through the questions; a passphrase is fine).

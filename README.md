@@ -5,7 +5,7 @@ packaged as a skill: a `SKILL.md` your agent follows step by step, plus the file
 
 | Feature | What it does | Version |
 |---------|--------------|---------|
-| [vps-agents](vps-agents/) | Run your Buzz agents on your own Linux server, with an hourly security watchdog | 0.1.0 |
+| [vps-agents](vps-agents/) | Run your Buzz agents on your own Linux server, with an hourly security watchdog | 0.1.0 (draft) |
 
 ## Using a feature
 
@@ -20,7 +20,10 @@ it used last time to see if there is something newer.
 - No secrets, addresses or personal details in this repository. Each owner uses their own
   accounts and keys.
 - Nothing destructive without the owner's yes. Every feature lists its undo.
-- Tested on a clean setup before it is listed here.
+- Tested on a clean setup before it leaves draft.
+
+**vps-agents is a draft.** It is the scripted form of a setup that runs in production, but
+`server-setup.sh` has not yet been run end to end on a fresh server. Expect rough edges.
 
 ## Use at your own risk
 
