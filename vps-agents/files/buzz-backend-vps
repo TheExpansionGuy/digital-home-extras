@@ -1,0 +1,408 @@
+#!/usr/bin/python3
+"""buzz-backend-vps: Buzz Desktop backend provider for a plain Linux server.
+
+Implements provider protocol v1 from block/buzz docs/remote-agents.md
+(read at tag desktop-v0.5.28): one JSON object on stdin, one on stdout,
+operations `info` and `deploy`.
+
+Substrate binding (the spec's layer 3, in this provider's own terms):
+  - One systemd unit per agent identity: buzz-agent@<first 16 hex of pubkey>.
+    systemd allows one instance per unit name, which is the at-most-one-live
+    guarantee within this provider's scope.
+  - The agent's environment is written to a 0600 JSON file owned by the
+    unprivileged `buzz` user. The launcher execs buzz-acp, so SIGTERM from
+    systemd reaches the harness itself.
+  - Restart=on-failure: an intentional clean exit (owner !shutdown, inactivity
+    reap) is never restarted. Starting it again is a re-deploy from Desktop.
+  - A deploy whose environment is identical to a running unit is a no-op.
+
+Server prerequisites (installed once by server-setup.sh): /opt/buzz/bin/buzz-acp, the
+`buzz` user with the ACP agent on its PATH, and key-based SSH for the Mac.
+Nothing secret is ever written to stdout or stderr.
+"""
+import hashlib
+import io
+import json
+import re
+import subprocess
+import sys
+import tarfile
+import time
+import uuid
+
+VERSION = "0.1.0"
+PROTOCOL_VERSION = 1
+SSH = "/usr/bin/ssh"
+
+# Authoritative (tier 3) keys: only this provider may set them.
+RESERVED = {
+    "BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY", "NOSTR_PRIVATE_KEY", "BUZZ_AUTH_TAG",
+    "BUZZ_ACP_AGENT_OWNER", "BUZZ_ACP_AGENT_COMMAND", "BUZZ_ACP_AGENT_ARGS",
+    "BUZZ_ACP_RESPOND_TO", "BUZZ_ACP_RESPOND_TO_ALLOWLIST", "BUZZ_ACP_MCP_COMMAND",
+    "BUZZ_ACP_EXIT_AFTER_INACTIVITY", "BUZZ_MANAGED_AGENT_START_NONCE",
+}
+# Desktop-host values that mean nothing on the server; re-derived there or dropped.
+HOST_RESOLVED = {
+    "PATH", "HOME", "CLAUDE_CODE_EXECUTABLE", "BUZZ_ACP_SETUP_PAYLOAD",
+    "BUZZ_MANAGED_AGENT", "TMPDIR", "SHELL", "USER", "LOGNAME",
+}
+FORBIDDEN = {"BUZZ_ACP_NO_PRESENCE"}
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+CONFIG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "host": {
+            "type": "string",
+            "title": "Server address",
+            "description": "IP address or hostname of the server. Your Mac must already be able to log in to it with an SSH key.",
+        },
+        "ssh_user": {
+            "type": "string",
+            "title": "Login user",
+            "description": "Account used to install and start the agent service.",
+            "default": "root",
+        },
+        "inactivity_seconds": {
+            "type": "number",
+            "title": "Stop after inactivity (seconds)",
+            "description": "0 keeps the agent running until you stop it.",
+            "default": 0,
+        },
+    },
+    "required": ["host"],
+}
+
+
+class DeployError(Exception):
+    pass
+
+
+# --- identity: nsec (bech32) -> x-only public key (hex) ---------------------
+
+_B32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+      0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+
+
+def _bech32_polymod(values):
+    gen = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = (chk & 0x1FFFFFF) << 5 ^ v
+        for i in range(5):
+            chk ^= gen[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def _nsec_to_secret(nsec):
+    nsec = nsec.strip().lower()
+    if not nsec.startswith("nsec1"):
+        raise DeployError("agent private key is not an nsec")
+    hrp, data = "nsec", nsec[5:]
+    try:
+        values = [_B32.index(c) for c in data]
+    except ValueError:
+        raise DeployError("agent private key is not valid bech32")
+    expanded = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+    if _bech32_polymod(expanded + values) != 1:
+        raise DeployError("agent private key failed its checksum")
+    acc = bits = 0
+    out = bytearray()
+    for v in values[:-6]:
+        acc = (acc << 5) | v
+        bits += 5
+        while bits >= 8:
+            bits -= 8
+            out.append((acc >> bits) & 0xFF)
+    if len(out) != 32:
+        raise DeployError("agent private key has the wrong length")
+    return int.from_bytes(out, "big")
+
+
+def _ec_add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0] and (a[1] + b[1]) % _P == 0:
+        return None
+    if a == b:
+        lam = 3 * a[0] * a[0] * pow(2 * a[1], _P - 2, _P) % _P
+    else:
+        lam = (b[1] - a[1]) * pow(b[0] - a[0], _P - 2, _P) % _P
+    x = (lam * lam - a[0] - b[0]) % _P
+    return (x, (lam * (a[0] - x) - a[1]) % _P)
+
+
+def pubkey_hex(nsec):
+    d = _nsec_to_secret(nsec)
+    if not 0 < d < _N:
+        raise DeployError("agent private key is out of range")
+    result, addend = None, _G
+    while d:
+        if d & 1:
+            result = _ec_add(result, addend)
+        addend = _ec_add(addend, addend)
+        d >>= 1
+    return "%064x" % result[0]
+
+
+# --- environment assembly (spec: Launch data, three tiers, later wins) -------
+
+def build_env(agent, config, generation):
+    nsec = (agent.get("private_key_nsec") or "").strip()
+    if not nsec:
+        raise DeployError("refusing to deploy: the agent has no private key")
+    relay_url = (agent.get("relay_url") or "").strip()
+    if not re.match(r"^wss?://", relay_url):
+        raise DeployError("refusing to deploy: the agent has no relay URL")
+    if (agent.get("provider") or "").strip() == "relay-mesh":
+        raise DeployError("shared-compute agents cannot run on a remote server")
+
+    launch = agent.get("launch") or {}
+    auth_tag = agent.get("auth_tag")
+    if auth_tag is not None and not isinstance(auth_tag, str):
+        auth_tag = json.dumps(auth_tag, separators=(",", ":"))
+    owner = launch.get("owner_pubkey")
+    if not auth_tag and not owner:
+        raise DeployError("refusing to deploy: no owner authorisation for this agent")
+
+    env = {}
+
+    def layer(values):
+        for key, value in (values or {}).items():
+            if key in FORBIDDEN:
+                raise DeployError("%s must not be set on a remote agent" % key)
+            if not ENV_KEY_RE.match(key) or key in RESERVED or key in HOST_RESOLVED:
+                continue
+            if isinstance(value, str) and "\x00" not in value:
+                env[key] = value
+
+    if launch:
+        layer(launch.get("policy_env"))   # tier 1
+        layer(launch.get("env"))          # tier 2 (already includes user env_vars)
+        command = launch.get("command") or ""
+        args = launch.get("args") or []
+    else:
+        # Desktop predating the launch block: fall back to the legacy fields.
+        layer(agent.get("env_vars"))
+        if agent.get("system_prompt"):
+            env["BUZZ_ACP_SYSTEM_PROMPT"] = agent["system_prompt"]
+        if agent.get("parallelism"):
+            env["BUZZ_ACP_AGENTS"] = str(agent["parallelism"])
+        command = agent.get("agent_command") or ""
+        args = agent.get("agent_args") or []
+
+    # Small servers: do not keep a pool of idle agent sessions warm.
+    env.setdefault("BUZZ_ACP_LAZY_POOL", "true")
+
+    command = command.rsplit("/", 1)[-1]
+    if not COMMAND_RE.match(command):
+        raise DeployError("refusing to deploy: the agent has no runnable command")
+
+    # tier 3: authoritative, written last.
+    env["BUZZ_RELAY_URL"] = relay_url
+    env["BUZZ_PRIVATE_KEY"] = nsec
+    env["NOSTR_PRIVATE_KEY"] = nsec
+    if auth_tag:
+        env["BUZZ_AUTH_TAG"] = auth_tag
+    else:
+        env["BUZZ_ACP_AGENT_OWNER"] = owner
+    env["BUZZ_ACP_AGENT_COMMAND"] = command
+    env["BUZZ_ACP_AGENT_ARGS"] = ",".join(str(a) for a in args)
+    env["BUZZ_ACP_MCP_COMMAND"] = ""
+    if agent.get("respond_to"):
+        env["BUZZ_ACP_RESPOND_TO"] = str(agent["respond_to"])
+    if agent.get("respond_to_allowlist"):
+        env["BUZZ_ACP_RESPOND_TO_ALLOWLIST"] = ",".join(agent["respond_to_allowlist"])
+    inactivity = int(config.get("inactivity_seconds") or 0)
+    if inactivity < 0:
+        raise DeployError("inactivity_seconds cannot be negative")
+    if inactivity:
+        env["BUZZ_ACP_EXIT_AFTER_INACTIVITY"] = str(inactivity)
+
+    # Fingerprint excludes the per-attempt nonce so an unchanged re-deploy is a no-op.
+    fingerprint = hashlib.sha256(
+        json.dumps(env, sort_keys=True).encode()).hexdigest()
+    env["BUZZ_MANAGED_AGENT_START_NONCE"] = generation
+    return env, fingerprint
+
+
+# --- server side --------------------------------------------------------------
+
+LAUNCHER = r'''#!/usr/bin/python3
+# Installed by buzz-backend-vps. Loads one agent's environment and becomes buzz-acp.
+import json, os, sys
+d = sys.argv[1]
+env = json.load(open(os.path.join(d, "env.json")))
+home = os.path.expanduser("~")
+env["HOME"] = home
+env["PATH"] = home + "/.npm-global/bin:/opt/buzz/bin:/usr/local/bin:/usr/bin:/bin"
+# Server agents must not inherit the owner's claude.ai account connectors (Gmail, Drive,
+# Supabase, ...). Set last so an agent's own environment cannot switch them back on.
+env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
+work = os.path.join(d, "workspace")
+os.makedirs(work, exist_ok=True)
+os.chdir(work)
+os.execve("/opt/buzz/bin/buzz-acp", ["buzz-acp"], env)
+'''
+
+UNIT = '''# Installed by buzz-backend-vps. One Buzz agent per instance name.
+[Unit]
+Description=Buzz agent %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=buzz
+Group=buzz
+ExecStart=/usr/bin/python3 /opt/buzz/launch.py /home/buzz/agents/%i
+Restart=on-failure
+RestartSec=10s
+KillMode=mixed
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+'''
+
+REMOTE = r'''set -eu
+ID="$1"; FP="$2"
+D="/home/buzz/agents/$ID"; U="buzz-agent@$ID"
+[ -x /opt/buzz/bin/buzz-acp ] || { echo "RESULT error buzz-acp is not installed on the server"; exit 0; }
+id buzz >/dev/null 2>&1 || { echo "RESULT error the buzz user does not exist on the server"; exit 0; }
+STAGE="$(mktemp -d /home/buzz/.deploy.XXXXXX)"
+trap 'rm -rf "$STAGE"' EXIT
+tar -xf - -C "$STAGE"
+CMD="$(cat "$STAGE/command")"
+su - buzz -c "PATH=\$HOME/.npm-global/bin:/opt/buzz/bin:/usr/local/bin:/usr/bin:/bin command -v '$CMD'" >/dev/null 2>&1 \
+  || { echo "RESULT error $CMD is not installed for the buzz user on the server"; exit 0; }
+if [ "$(systemctl is-active "$U" 2>/dev/null)" = active ] && [ -f "$D/fingerprint" ] && [ "$(cat "$D/fingerprint")" = "$FP" ]; then
+  echo "RESULT ok unchanged"; exit 0
+fi
+install -m 755 "$STAGE/launch.py" /opt/buzz/launch.py
+if ! cmp -s "$STAGE/unit" /etc/systemd/system/buzz-agent@.service 2>/dev/null; then
+  install -m 644 "$STAGE/unit" /etc/systemd/system/buzz-agent@.service
+  systemctl daemon-reload
+fi
+install -d -m 700 -o buzz -g buzz /home/buzz/agents "$D"
+install -m 600 -o buzz -g buzz "$STAGE/env.json" "$D/env.json.new"
+mv -f "$D/env.json.new" "$D/env.json"
+printf '%s' "$FP" > "$D/fingerprint"; printf 'buzz-backend-vps\n' > "$D/managed-by"
+chown buzz:buzz "$D/fingerprint" "$D/managed-by"; chmod 600 "$D/fingerprint"
+systemctl enable "$U" >/dev/null 2>&1
+SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
+systemctl restart "$U"
+i=0
+while [ $i -lt 45 ]; do
+  if journalctl -u "$U" --since "$SINCE" -o cat --no-pager 2>/dev/null | grep -q "connected to relay"; then
+    [ "$(systemctl is-active "$U")" = active ] && { echo "RESULT ok started"; exit 0; }
+  fi
+  [ "$(systemctl is-failed "$U" 2>/dev/null)" = failed ] && break
+  [ "$(systemctl show "$U" -p NRestarts --value 2>/dev/null)" != 0 ] && break
+  i=$((i+1)); sleep 1
+done
+# Never started: do not leave a unit retrying with an identity the relay refused.
+WHY="$(journalctl -u "$U" --since "$SINCE" -o cat --no-pager 2>/dev/null | grep -m1 -o 'Auth failed: [a-z: ]*' || true)"
+systemctl disable --now "$U" >/dev/null 2>&1 || true
+systemctl reset-failed "$U" >/dev/null 2>&1 || true
+echo "RESULT error the agent did not connect to the relay${WHY:+ ($WHY)}; its service has been switched off"
+'''
+
+
+def deploy(request):
+    agent = request.get("agent")
+    if not isinstance(agent, dict):
+        raise DeployError("deploy request has no agent payload")
+    config = request.get("provider_config") or {}
+    host = str(config.get("host") or "").strip()
+    user = str(config.get("ssh_user") or "root").strip()
+    if not HOST_RE.match(host):
+        raise DeployError("server address is missing or not a valid hostname or IP")
+    if not USER_RE.match(user):
+        raise DeployError("login user is not a valid account name")
+
+    generation = uuid.uuid4().hex[:12]
+    env, fingerprint = build_env(agent, config, generation)
+    agent_key = pubkey_hex(env["BUZZ_PRIVATE_KEY"])[:16]
+
+    files = {
+        "env.json": json.dumps(env),
+        "launch.py": LAUNCHER,
+        "unit": UNIT,
+        "command": env["BUZZ_ACP_AGENT_COMMAND"],
+    }
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, content in files.items():
+            data = content.encode()
+            info = tarfile.TarInfo(name)
+            info.size, info.mode, info.mtime = len(data), 0o600, int(time.time())
+            tar.addfile(info, io.BytesIO(data))
+
+    cmd = [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+           "-o", "StrictHostKeyChecking=yes", "-o", "LogLevel=ERROR",
+           "%s@%s" % (user, host),
+           "sh -c '%s' sh %s %s" % (REMOTE.replace("'", "'\\''"), agent_key, fingerprint)]
+    try:
+        proc = subprocess.run(cmd, input=buf.getvalue(), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=180)
+    except subprocess.TimeoutExpired:
+        raise DeployError("timed out talking to the server")
+    result = [l for l in proc.stdout.decode(errors="replace").splitlines()
+              if l.startswith("RESULT ")]
+    if proc.returncode != 0 or not result:
+        raise DeployError("could not reach or prepare the server over SSH (exit %d)"
+                          % proc.returncode)
+    status, _, detail = result[-1][7:].partition(" ")
+    if status != "ok":
+        raise DeployError(detail or "the server refused the deploy")
+    return {"ok": True, "agent_id": "vps:%s:%s" % (host, agent_key)}
+
+
+def main():
+    try:
+        request = json.loads(sys.stdin.read())
+        if not isinstance(request, dict):
+            raise ValueError("request must be a JSON object")
+    except ValueError as e:
+        print(json.dumps({"ok": False, "error": "request is not valid JSON: %s" % e}))
+        return 1
+    op = request.get("op")
+    try:
+        if op == "info":
+            print(json.dumps({
+                "ok": True, "name": "vps", "version": VERSION,
+                "protocol_version": PROTOCOL_VERSION,
+                "description": "Runs agents as services on your own Linux server over SSH",
+                "config_schema": CONFIG_SCHEMA,
+            }))
+            return 0
+        if op == "deploy":
+            print(json.dumps(deploy(request)))
+            return 0
+        print(json.dumps({"ok": False, "error": "unknown op"}))
+        return 1
+    except DeployError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 1
+    except Exception as e:  # never leak a traceback: it could carry the payload
+        print(json.dumps({"ok": False, "error": "provider crashed: %s" % type(e).__name__}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

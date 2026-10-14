@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# server-watchdog: plain, no-AI health and security checks for the VPS.
+#
+#   server-watchdog              run the checks; raise the alarm if the findings changed
+#   server-watchdog --dry-run    run the checks and print findings; send nothing
+#   server-watchdog --report     print a full inspection report (used by the weekly inspection)
+#   server-watchdog --rebaseline accept the current users, keys and SSH config as the known-good state
+#   server-watchdog --test-alarm send one test message through the alarm line
+#
+# Runs as root from server-watchdog.timer. Reads only; it never changes the system.
+set -u
+export LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+CONF_DIR=/etc/server-watchdog
+STATE_DIR=/var/lib/server-watchdog
+ALARM_ENV=$CONF_DIR/alarm.env          # ALARM_URL=..., ALARM_SECRET=... (0600 root)
+BASELINE=$STATE_DIR/baseline
+LAST_SENT=$STATE_DIR/last-sent
+LAST_RUN=$STATE_DIR/last-run
+
+# Tunables. Override in $CONF_DIR/watchdog.conf.
+ALLOWED_PORTS="tcp:22"                 # public listeners that are expected
+ALLOWED_UFW="22/tcp"                   # ufw ALLOW IN rules that are expected
+IGNORE_FAILED_UNITS=""                 # failed units already looked at and accepted
+DISK_PCT_MAX=85
+MEM_AVAIL_MIN_MB=300
+FAILED_LOGINS_MAX=2000                 # per 24h; background noise is normal
+REBOOT_PENDING_MAX_DAYS=7
+REMIND_HOURS=24                        # repeat an unchanged alarm this often
+DOOR_RECHECK_SECS=20                   # a listener must survive this long to count
+LOGINS_NOT_BEFORE=""                   # ignore logins before this time (e.g. before the lockdown)
+[ -r "$CONF_DIR/watchdog.conf" ] && . "$CONF_DIR/watchdog.conf"
+
+mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+
+PROBLEMS=()
+problem() { PROBLEMS+=("$1"); }
+
+fingerprint_state() {
+    # Everything an intruder would have to touch to keep a way back in.
+    {
+        echo "## login users"
+        awk -F: '$7 !~ /(nologin|false)$/ {print $1":"$3":"$7}' /etc/passwd | sort
+        echo "## root-equivalent"
+        awk -F: '$3 == 0 {print $1}' /etc/passwd | sort
+        getent group sudo admin 2>/dev/null | sort
+        echo "## authorized keys"
+        for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys /etc/ssh/authorized_keys/*; do
+            [ -f "$f" ] && echo "$f $(grep -cv '^\s*\(#\|$\)' "$f") $(sha256sum < "$f" | cut -d' ' -f1)"
+        done
+        echo "## sudoers"
+        cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null | sha256sum | cut -d' ' -f1
+        echo "## sshd effective"
+        sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|authorizedkeysfile|permitemptypasswords) ' | sort
+    }
+}
+
+known_key_fingerprints() {
+    for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+        [ -s "$f" ] && ssh-keygen -lf "$f" 2>/dev/null | awk '{print $2}'
+    done | sort -u
+}
+
+public_listeners() {  # proto port owner
+    ss -tulnpH 2>/dev/null | awk '{
+        addr = $5; if (addr ~ /^127\./ || addr ~ /^\[::1\]/ || addr ~ /%lo:/) next
+        n = split(addr, a, ":"); owner = "unknown"
+        if (match($0, /users:\(\("[^"]+"/)) owner = substr($0, RSTART + 9, RLENGTH - 10)
+        print $1, a[n], owner
+    }' | sort -u
+}
+
+check_doors() {
+    # Outgoing lookups (DNS, time sync) hold a UDP socket for a moment and look like
+    # listeners. A door only counts if it is still there on a second look.
+    local first proto port owner
+    first=$(public_listeners)
+    if awk '{print $1":"$2}' <<<"$first" | grep -qvxF -f <(tr ' ' '\n' <<<"$ALLOWED_PORTS"); then
+        sleep "$DOOR_RECHECK_SECS"
+    fi
+    while read -r proto port owner; do
+        [ -z "$proto" ] && continue
+        case " $ALLOWED_PORTS " in *" $proto:$port "*) continue ;; esac
+        grep -q "^$proto $port " <<<"$first" || continue
+        problem "Unexpected open door: $proto port $port is listening to the internet (program: $owner)."
+    done < <(public_listeners)
+}
+
+check_firewall() {
+    local st
+    st=$(ufw status verbose 2>/dev/null)
+    if ! grep -q '^Status: active' <<<"$st"; then
+        problem "Firewall is switched off."
+        return
+    fi
+    grep -q '^Default: deny (incoming)' <<<"$st" || problem "Firewall no longer blocks incoming traffic by default."
+    local rule
+    while read -r rule; do
+        [ -z "$rule" ] && continue
+        case " $ALLOWED_UFW " in *" $rule "*) ;; *) problem "Firewall has an extra opening: $rule." ;; esac
+    done < <(awk '/ALLOW IN/ {print $1}' <<<"$st" | sort -u)
+}
+
+check_ssh() {
+    local t
+    t=$(sshd -T 2>/dev/null)
+    grep -qi '^passwordauthentication no' <<<"$t" || problem "SSH password login is switched ON. It must be key-only."
+    grep -qi '^kbdinteractiveauthentication no' <<<"$t" || problem "SSH keyboard-interactive login is switched on."
+    grep -Eqi '^permitrootlogin (without-password|prohibit-password|no)' <<<"$t" || problem "SSH allows root to log in with a password."
+    grep -qi '^permitemptypasswords no' <<<"$t" || problem "SSH allows empty passwords."
+}
+
+check_guards() {
+    local u
+    for u in ssh fail2ban; do
+        systemctl is-active --quiet "$u" || problem "Service $u is not running."
+    done
+    fail2ban-client status sshd >/dev/null 2>&1 || problem "The password-guesser ban (fail2ban sshd jail) is not working."
+    systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null || problem "Automatic security patching is switched off."
+    systemctl is-active --quiet unattended-upgrades 2>/dev/null || problem "Automatic security patching service is not running."
+    if [ -f /var/run/reboot-required ]; then
+        local age=$(( ( $(date +%s) - $(stat -c %Y /var/run/reboot-required) ) / 86400 ))
+        [ "$age" -ge "$REBOOT_PENDING_MAX_DAYS" ] && problem "A security update has been waiting $age days for a restart."
+    fi
+}
+
+check_units() {
+    local u
+    while read -r u; do
+        [ -z "$u" ] && continue
+        case " $IGNORE_FAILED_UNITS " in *" $u "*) continue ;; esac
+        problem "Service $u has failed."
+    done < <(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+    # Every agent that is meant to start at boot must be up.
+    while read -r u; do
+        [ -z "$u" ] && continue
+        systemctl is-active --quiet "$u" || problem "Agent service $u is enabled but not running."
+    done < <(systemctl list-unit-files 'buzz-agent@*' --state=enabled --no-legend 2>/dev/null | awk '{print $1}' | grep -v '@\.service$')
+}
+
+check_resources() {
+    local pct mnt avail
+    while read -r pct mnt; do
+        pct=${pct%\%}
+        [ "$pct" -ge "$DISK_PCT_MAX" ] 2>/dev/null && problem "Disk $mnt is ${pct}% full."
+    done < <(df -P -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | awk 'NR>1 {print $5, $6}')
+    while read -r pct mnt; do
+        pct=${pct%\%}
+        [ "$pct" -ge "$DISK_PCT_MAX" ] 2>/dev/null && problem "Disk $mnt has used ${pct}% of its file slots (inodes)."
+    done < <(df -Pi -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | awk 'NR>1 && $5 != "-" {print $5, $6}')
+    avail=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
+    [ "${avail:-9999}" -lt "$MEM_AVAIL_MIN_MB" ] && problem "Memory is nearly exhausted: ${avail} MB free."
+}
+
+check_logins() {
+    local known line fp n since="-25h"
+    known=$(known_key_fingerprints)
+    if [ -n "$LOGINS_NOT_BEFORE" ] && [ "$(date -d "$LOGINS_NOT_BEFORE" +%s)" -gt "$(date -d '25 hours ago' +%s)" ]; then
+        since=$LOGINS_NOT_BEFORE
+    fi
+    # Any way in that is not one of the keys on file.
+    while read -r line; do
+        [ -z "$line" ] && continue
+        if grep -q 'Accepted publickey' <<<"$line"; then
+            fp=$(grep -o 'SHA256:[A-Za-z0-9+/=]*' <<<"$line" | head -1)
+            grep -qxF "$fp" <<<"$known" && continue
+            problem "Someone logged in with a key that is not on file: $(sed -E 's/^.*(Accepted .*)$/\1/' <<<"$line" | cut -c1-120)"
+        else
+            problem "Someone logged in without a key: $(sed -E 's/^.*(Accepted .*)$/\1/' <<<"$line" | cut -c1-120)"
+        fi
+    done < <(journalctl -u ssh -u sshd --since "$since" --no-pager -o cat 2>/dev/null | grep '^Accepted ' | sort -u)
+    n=$(journalctl -u ssh -u sshd --since "-24h" --no-pager -o cat 2>/dev/null | grep -Ec 'Failed password|Invalid user|authentication failure')
+    [ "${n:-0}" -ge "$FAILED_LOGINS_MAX" ] && problem "Unusually heavy break-in attempts: $n failed logins in 24 hours."
+}
+
+check_baseline() {
+    if [ ! -f "$BASELINE" ]; then
+        fingerprint_state > "$BASELINE"; chmod 600 "$BASELINE"
+        return
+    fi
+    local d
+    d=$(diff <(cat "$BASELINE") <(fingerprint_state) | grep '^[<>]' | grep -v '^[<>] ##' | head -8)
+    [ -n "$d" ] && problem "Users, keys or SSH settings changed since the last approved state: $(tr '\n' ';' <<<"$d" | cut -c1-400)"
+}
+
+run_checks() {
+    check_doors; check_firewall; check_ssh; check_guards; check_units
+    check_resources; check_logins; check_baseline
+}
+
+send_alarm() {  # level, summary
+    [ -r "$ALARM_ENV" ] || { echo "no alarm line configured ($ALARM_ENV)" >&2; return 1; }
+    local ALARM_URL="" ALARM_SECRET="" body code
+    . "$ALARM_ENV"
+    body=$(jq -n --arg level "$1" --arg host "$(hostname)" --arg when "$(date -u '+%Y-%m-%d %H:%M UTC')" \
+        --arg summary "$2" '{level:$level, host:$host, when:$when, summary:$summary}')
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 --retry 2 \
+        -H "X-Webhook-Secret: $ALARM_SECRET" -H 'Content-Type: application/json' \
+        -X POST --data "$body" "$ALARM_URL" 2>/dev/null)
+    case "$code" in 2??) return 0 ;; *) echo "alarm delivery failed (HTTP ${code:-none})" >&2; return 1 ;; esac
+}
+
+bullets() { local p; for p in "$@"; do echo "- $p"; done; }
+
+report() {
+    echo "=== server-watchdog report: $(hostname) $(date -u '+%Y-%m-%d %H:%M UTC') ==="
+    echo "uptime: $(uptime -p), since $(uptime -s)"
+    echo "kernel: $(uname -r)   reboot pending: $([ -f /var/run/reboot-required ] && echo yes || echo no)"
+    echo; echo "--- findings"
+    run_checks
+    if [ ${#PROBLEMS[@]} -eq 0 ]; then echo "none"; else bullets "${PROBLEMS[@]}"; fi
+    echo; echo "--- watchdog"
+    systemctl show server-watchdog.timer -p ActiveState -p LastTriggerUSec -p NextElapseUSecRealtime 2>/dev/null
+    echo "last run: $(cat "$LAST_RUN" 2>/dev/null || echo never)"
+    echo "last alarm sent: $([ -f "$LAST_SENT" ] && date -u -r "$LAST_SENT" '+%Y-%m-%d %H:%M UTC' || echo never)"
+    journalctl -t server-watchdog --since "-8d" --no-pager -o short-iso 2>/dev/null | grep -v 'all clear' | tail -15
+    echo; echo "--- public listeners"; ss -tulnH | awk '{print $1, $5}' | grep -Ev ' (127\.|\[::1\])|%lo:' | sort -u
+    echo; echo "--- firewall"; ufw status verbose 2>/dev/null | sed -n '1,3p;/ALLOW\|DENY\|LIMIT/p'
+    echo; echo "--- ssh effective"; sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication) '
+    echo; echo "--- logins accepted, 8 days"
+    journalctl -u ssh -u sshd --since "-8d" --no-pager -o short-iso 2>/dev/null | grep 'Accepted ' | awk '{print $1, $4, $5, $6, $7, $8, $9}' | tail -40
+    echo; echo "--- failed logins, 8 days: $(journalctl -u ssh -u sshd --since "-8d" --no-pager -o cat 2>/dev/null | grep -Ec 'Failed password|Invalid user|authentication failure')"
+    fail2ban-client status sshd 2>/dev/null | grep -E 'Total failed|Currently banned|Total banned'
+    echo; echo "--- patches"
+    echo "upgradable packages: $(apt list --upgradable 2>/dev/null | grep -c upgradable)"
+    echo "last unattended upgrade: $(grep -h 'Packages that will be upgraded\|No packages found' /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null | tail -1)"
+    echo; echo "--- resources"; df -h / | tail -1; free -m | sed -n '1,2p'
+    echo; echo "--- agents"; systemctl list-units 'buzz-agent@*' --all --no-legend --plain 2>/dev/null
+    ls /home/buzz/agents 2>/dev/null | sed 's/^/agent folder: /'
+    echo; echo "--- users with a login shell"; awk -F: '$7 !~ /(nologin|false)$/ {print $1, $3, $7}' /etc/passwd
+    echo; echo "--- keys on file"
+    for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do [ -s "$f" ] && ssh-keygen -lf "$f" | sed "s|^|$f: |"; done
+    echo; echo "--- scheduled jobs outside the system's own"
+    for u in $(cut -d: -f1 /etc/passwd); do crontab -l -u "$u" 2>/dev/null | grep -v '^\s*\(#\|$\)' | sed "s/^/cron($u): /"; done
+    ls /etc/cron.d 2>/dev/null | sed 's/^/cron.d: /'
+    systemctl list-unit-files --type=timer --no-legend 2>/dev/null | awk '{print $1}' | while read -r t; do
+        p=$(systemctl show "$t" -p FragmentPath --value 2>/dev/null); case "$p" in /etc/*) echo "timer: $t" ;; esac; done
+    echo; echo "--- failed units"; systemctl --failed --no-legend --plain 2>/dev/null
+    echo; echo "--- processes by memory"; ps -eo user:10,rss:9,comm --sort=-rss | head -8
+}
+
+case "${1:-}" in
+    --report) report; exit 0 ;;
+    --rebaseline) fingerprint_state > "$BASELINE"; chmod 600 "$BASELINE"; rm -f "$LAST_SENT" "$LAST_SENT.hash"; echo "baseline saved"; exit 0 ;;
+    --test-alarm) send_alarm "TEST" "- This is a test of the alarm line. Nothing is wrong." && echo "sent"; exit $? ;;
+    --dry-run) run_checks; if [ ${#PROBLEMS[@]} -eq 0 ]; then echo "all clear"; else bullets "${PROBLEMS[@]}"; fi; exit 0 ;;
+    "") ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+esac
+
+run_checks
+date -u '+%Y-%m-%d %H:%M UTC' > "$LAST_RUN"
+
+if [ ${#PROBLEMS[@]} -eq 0 ]; then
+    if [ -f "$LAST_SENT.hash" ]; then
+        send_alarm "ALL CLEAR" "- Everything reported earlier is back to normal." && rm -f "$LAST_SENT" "$LAST_SENT.hash"
+        logger -t server-watchdog "all clear (recovered)"
+    else
+        logger -t server-watchdog "all clear"
+    fi
+    exit 0
+fi
+
+summary=$(bullets "${PROBLEMS[@]}" | cut -c1-500 | head -15)
+hash=$(sha256sum <<<"$summary" | cut -d' ' -f1)
+logger -t server-watchdog "PROBLEMS: $(tr '\n' ' ' <<<"$summary")"
+
+# Speak when the findings change, then once per REMIND_HOURS while they stand.
+if [ "$(cat "$LAST_SENT.hash" 2>/dev/null)" = "$hash" ] && [ -f "$LAST_SENT" ] \
+   && [ $(( $(date +%s) - $(stat -c %Y "$LAST_SENT") )) -lt $(( REMIND_HOURS * 3600 )) ]; then
+    exit 0
+fi
+if send_alarm "ALARM" "$summary"; then
+    echo "$hash" > "$LAST_SENT.hash"; touch "$LAST_SENT"
+else
+    logger -t server-watchdog "alarm delivery FAILED; will retry on the next run"
+    exit 1
+fi
